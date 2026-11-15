@@ -1,0 +1,96 @@
+name: trust-receipt
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: trust-receipt-${{ github.event.pull_request.number || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  receipt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP: https://tieto-trust.srv2159196.hstgr.cloud
+      REPO: ${{ github.repository }}
+      WAIT_SECONDS: ${{ github.event_name == 'pull_request' && '600' || '0' }}
+    steps:
+      - name: Set the trust-receipt status from the stored receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            prs="${{ github.event.pull_request.number }}"
+          else
+            prs=$(gh pr list -R "$REPO" --state open --json number --jq '.[].number')
+          fi
+
+          check() {
+            local pr="$1" head branch review url body tag owner signed_at evidence state desc
+            head=$(gh pr view "$pr" -R "$REPO" --json headRefOid --jq .headRefOid)
+            branch=$(gh pr view "$pr" -R "$REPO" --json headRefName --jq .headRefName)
+            if [[ ! "$branch" =~ ju26-issue-([0-9]+) ]]; then
+              echo "PR #$pr ($branch) has no review"; return 0
+            fi
+            review="REQ-${BASH_REMATCH[1]}"
+            url="$APP/reviews/$review"
+            body=$(curl -fsS "$APP/api/receipts/$review/$head" || echo '{"_tag":"error"}')
+            tag=$(jq -r '._tag' <<<"$body")
+            evidence=$(jq -r '.evidenceCommit // ""' <<<"$body")
+            case "$tag" in
+              signed)
+                owner=$(jq -r '.receipt.owner' <<<"$body")
+                signed_at=$(jq -r '.receipt.signedAt' <<<"$body")
+                state=success; desc="Signed by $owner for ${head:0:8}" ;;
+              pending)
+                state=pending; desc="Waiting for a named owner to sign ${head:0:8}" ;;
+              stale)
+                state=failure; desc="Evidence is for $evidence, not ${head:0:8}. Rerun the pipeline." ;;
+              *)
+                state=error; desc="The receipt store did not answer" ;;
+            esac
+            gh api -X POST "repos/$REPO/statuses/$head" -f state="$state" -f context=trust-receipt \
+              -f description="${desc:0:140}" -f target_url="$url" >/dev/null
+            echo "PR #$pr $review ${head:0:8}: $state - $desc"
+
+            local marker="<!-- trust-receipt -->" comment id
+            comment="$marker
+          ### Trust Receipt: \`$state\`
+          | | |
+          |---|---|
+          | Review | [$review]($url) |
+          | Head commit | \`${head:0:8}\` |
+          | Evidence for | \`${evidence:-unknown}\` |
+          | Status | $desc |
+          ${signed_at:+| Signed at | $signed_at |}
+
+          The \`trust-receipt\` check is green only when a named engineer has signed the receipt for this exact commit. A new push makes the signature stale. The AI never approves."
+            id=$(gh api "repos/$REPO/issues/$pr/comments" --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+            if [ -n "$id" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$comment" >/dev/null
+            else
+              gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="$comment" >/dev/null
+            fi
+            [ "$state" = "pending" ] && return 2 || return 0
+          }
+
+          for pr in $prs; do
+            deadline=$(( $(date +%s) + WAIT_SECONDS ))
+            while true; do
+              rc=0; check "$pr" || rc=$?
+              [ "$rc" -ne 2 ] && break
+              [ "$(date +%s)" -ge "$deadline" ] && break
+              sleep 20
+            done
+          done
